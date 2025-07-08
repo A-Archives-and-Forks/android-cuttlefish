@@ -53,7 +53,6 @@
 #include "cuttlefish/host/commands/assemble_cvd/disk/vbmeta_enforce_minimum_size.h"
 #include "cuttlefish/host/commands/assemble_cvd/disk_builder.h"
 #include "cuttlefish/host/commands/assemble_cvd/flags/system_image_dir.h"
-#include "cuttlefish/host/commands/assemble_cvd/flags/use_16k.h"
 #include "cuttlefish/host/commands/assemble_cvd/super_image_mixer.h"
 #include "cuttlefish/host/libs/avb/avb.h"
 #include "cuttlefish/host/libs/config/ap_boot_flow.h"
@@ -70,14 +69,6 @@ namespace cuttlefish {
 using vm_manager::Gem5Manager;
 
 Result<void> ResolveInstanceFiles(const SystemImageDirFlag& system_image_dir) {
-  Use16kFlag use_16k = Use16kFlag::FromGlobalGflags();
-  if (use_16k.Use16k()) {
-    CF_EXPECT(FLAGS_kernel_path.empty(),
-              "--use_16k is not compatible with --kernel_path");
-    CF_EXPECT(FLAGS_initramfs_path.empty(),
-              "--use_16k is not compatible with --initramfs_path");
-  }
-
   // It is conflict (invalid) to pass both kernel_path/initramfs_path
   // and image file paths.
   bool flags_kernel_initramfs_has_input = (!FLAGS_kernel_path.empty())
@@ -99,7 +90,6 @@ Result<void> ResolveInstanceFiles(const SystemImageDirFlag& system_image_dir) {
   std::string default_vbmeta_system_dlkm_image = "";
   std::string default_16k_kernel_image = "";
   std::string default_16k_ramdisk_image = "";
-  std::string default_hibernation_image = "";
   std::string vvmtruststore_path = "";
 
   std::string comma_str = "";
@@ -128,18 +118,6 @@ Result<void> ResolveInstanceFiles(const SystemImageDirFlag& system_image_dir) {
         comma_str + cur_system_image_dir + "/vbmeta_vendor_dlkm.img";
     default_vbmeta_system_dlkm_image +=
         comma_str + cur_system_image_dir + "/vbmeta_system_dlkm.img";
-    default_hibernation_image +=
-        comma_str + cur_system_image_dir + "/hibernation_swap.img";
-    if (use_16k.Use16k()) {
-      const auto kernel_16k = cur_system_image_dir + "/kernel_16k";
-      const auto ramdisk_16k = cur_system_image_dir + "/ramdisk_16k.img";
-      default_16k_kernel_image += comma_str + kernel_16k;
-      default_16k_ramdisk_image += comma_str + ramdisk_16k;
-      CF_EXPECT(FileExists(kernel_16k),
-                kernel_16k + " missing for launching 16k cuttlefish");
-      CF_EXPECT(FileExists(ramdisk_16k),
-                ramdisk_16k + " missing for launching 16k cuttlefish");
-    }
 
     if (instance_index < default_vvmtruststore_file_name.size()) {
       if (default_vvmtruststore_file_name[instance_index].empty()) {
@@ -149,17 +127,6 @@ Result<void> ResolveInstanceFiles(const SystemImageDirFlag& system_image_dir) {
                               default_vvmtruststore_file_name[instance_index];
       }
     }
-  }
-  if (use_16k.Use16k()) {
-    LOG(INFO) << "Using 16k kernel: " << default_16k_kernel_image;
-    LOG(INFO) << "Using 16k ramdisk: " << default_16k_ramdisk_image;
-
-    SetCommandLineOptionWithMode("kernel_path",
-                                 default_16k_kernel_image.c_str(),
-                                 google::FlagSettingMode::SET_FLAGS_DEFAULT);
-    SetCommandLineOptionWithMode("initramfs_path",
-                                 default_16k_ramdisk_image.c_str(),
-                                 google::FlagSettingMode::SET_FLAGS_DEFAULT);
   }
   SetCommandLineOptionWithMode("boot_image", default_boot_image.c_str(),
                                google::FlagSettingMode::SET_FLAGS_DEFAULT);
@@ -181,9 +148,6 @@ Result<void> ResolveInstanceFiles(const SystemImageDirFlag& system_image_dir) {
   SetCommandLineOptionWithMode("vbmeta_system_dlkm_image",
                                default_vbmeta_system_dlkm_image.c_str(),
                                google::FlagSettingMode::SET_FLAGS_DEFAULT);
-  SetCommandLineOptionWithMode("hibernation_image",
-                               default_hibernation_image.c_str(),
-                               google::FlagSettingMode::SET_FLAGS_DEFAULT);
   SetCommandLineOptionWithMode("vvmtruststore_path", vvmtruststore_path.c_str(),
                                google::FlagSettingMode::SET_FLAGS_DEFAULT);
   return {};
@@ -192,7 +156,8 @@ Result<void> ResolveInstanceFiles(const SystemImageDirFlag& system_image_dir) {
 DiskBuilder OsCompositeDiskBuilder(
     const CuttlefishConfig& config,
     const CuttlefishConfig::InstanceSpecific& instance,
-    const MetadataImage& metadata, const MiscImage& misc) {
+    const MetadataImage& metadata, const MiscImage& misc,
+    const SystemImageDirFlag& system_image_dir) {
   auto builder =
       DiskBuilder()
           .VmManager(config.vm_manager())
@@ -204,7 +169,9 @@ DiskBuilder OsCompositeDiskBuilder(
     return builder.EntireDisk(instance.chromeos_disk())
         .CompositeDiskPath(instance.chromeos_disk());
   }
-  return builder.Partitions(GetOsCompositeDiskConfig(instance, metadata, misc))
+  return builder
+      .Partitions(
+          GetOsCompositeDiskConfig(instance, metadata, misc, system_image_dir))
       .HeaderPath(instance.PerInstancePath("os_composite_gpt_header.img"))
       .FooterPath(instance.PerInstancePath("os_composite_gpt_footer.img"))
       .CompositeDiskPath(instance.os_composite_disk_path());
@@ -328,8 +295,6 @@ Result<void> DiskImageFlagsVectorization(
 
   std::vector<std::string> custom_partition_path =
       android::base::Split(FLAGS_custom_partition_path, ",");
-  std::vector<std::string> hibernation_image =
-      android::base::Split(FLAGS_hibernation_image, ",");
 
   std::vector<std::string> bootloader =
       android::base::Split(FLAGS_bootloader, ",");
@@ -463,12 +428,6 @@ Result<void> DiskImageFlagsVectorization(
     } else {
       instance.set_custom_partition_path(custom_partition_path[instance_index]);
     }
-    if (instance_index >= hibernation_image.size()) {
-      instance.set_hibernation_partition_image(hibernation_image[0]);
-    } else {
-      instance.set_hibernation_partition_image(
-          hibernation_image[instance_index]);
-    }
     if (instance_index >= bootloader.size()) {
       instance.set_bootloader(bootloader[0]);
     } else {
@@ -557,8 +516,9 @@ Result<void> DiskImageFlagsVectorization(
   return {};
 }
 
-Result<void> CreateDynamicDiskFiles(const FetcherConfig& fetcher_config,
-                                    const CuttlefishConfig& config) {
+Result<void> CreateDynamicDiskFiles(
+    const FetcherConfig& fetcher_config, const CuttlefishConfig& config,
+    const SystemImageDirFlag& system_image_dir) {
   for (const auto& instance : config.Instances()) {
     // TODO(schuffelen): Unify this with the other injector created in
     // assemble_cvd.cpp
@@ -614,8 +574,8 @@ Result<void> CreateDynamicDiskFiles(const FetcherConfig& fetcher_config,
     MetadataImage metadata = CF_EXPECT(MetadataImage::ReuseOrCreate(instance));
     MiscImage misc = CF_EXPECT(MiscImage::ReuseOrCreate(instance));
 
-    DiskBuilder os_disk_builder =
-        OsCompositeDiskBuilder(config, instance, metadata, misc);
+    DiskBuilder os_disk_builder = OsCompositeDiskBuilder(
+        config, instance, metadata, misc, system_image_dir);
     const auto os_built_composite = CF_EXPECT(os_disk_builder.BuildCompositeDiskIfNecessary());
 
     auto ap_disk_builder = ApCompositeDiskBuilder(config, instance);
